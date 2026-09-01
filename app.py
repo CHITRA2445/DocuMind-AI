@@ -6,8 +6,6 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from datetime import datetime
-
 
 # --------------------------------------------------
 # 1. EXTRACT TEXT FROM PDF FILES
@@ -23,7 +21,7 @@ def get_pdf_text(pdf_docs):
             page_text = page.extract_text()
 
             if page_text:
-                text += page_text
+                text += page_text + "\n"
 
     return text
 
@@ -39,20 +37,28 @@ def get_text_chunks(text):
         chunk_overlap=200
     )
 
-    chunks = text_splitter.split_text(text)
-
-    return chunks
+    return text_splitter.split_text(text)
 
 
 # --------------------------------------------------
-# 3. CREATE VECTOR STORE USING FAISS
+# 3. LOAD EMBEDDING MODEL
+# --------------------------------------------------
+
+@st.cache_resource
+def load_embeddings():
+
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+
+# --------------------------------------------------
+# 4. CREATE VECTOR STORE USING FAISS
 # --------------------------------------------------
 
 def get_vector_store(text_chunks):
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
+    embeddings = load_embeddings()
 
     vector_store = FAISS.from_texts(
         text_chunks,
@@ -63,28 +69,69 @@ def get_vector_store(text_chunks):
 
 
 # --------------------------------------------------
-# 4. GET ANSWER FROM GEMINI
+# 5. CLEAN MODEL RESPONSE
+# --------------------------------------------------
+
+def extract_response_text(response):
+    """
+    Extract only the actual text from the model response.
+    Ignores metadata, signatures, SVG data, etc.
+    """
+
+    content = response.content
+
+    # Normal text response
+    if isinstance(content, str):
+        return content.strip()
+
+    # Content returned as a list
+    if isinstance(content, list):
+
+        text_parts = []
+
+        for item in content:
+
+            if isinstance(item, str):
+                text_parts.append(item)
+
+            elif isinstance(item, dict):
+
+                # Only extract actual text blocks
+                if item.get("type") == "text":
+                    text = item.get("text")
+
+                    if text:
+                        text_parts.append(text)
+
+        return "\n".join(text_parts).strip()
+
+    # Fallback
+    return str(content).strip()
+
+
+# --------------------------------------------------
+# 6. GET ANSWER FROM GEMINI
 # --------------------------------------------------
 
 def get_answer(user_question, vector_store, api_key):
 
-    # Find the most relevant text chunks
+    # Find relevant chunks
     docs = vector_store.similarity_search(
         user_question,
         k=4
     )
 
-    # Combine retrieved documents
+    # Combine retrieved document content
     context = "\n\n".join(
         doc.page_content for doc in docs
     )
 
     prompt = f"""
-You are a helpful AI assistant.
+You are DocuMind AI, a helpful document question-answering assistant.
 
 Answer the user's question ONLY using the context provided below.
 
-If the answer is not available in the context, clearly say:
+If the answer is not available in the provided context, clearly say:
 
 "Answer is not available in the provided PDF."
 
@@ -107,7 +154,7 @@ ANSWER:
 
     response = model.invoke(prompt)
 
-    return response.content
+    return extract_response_text(response)
 
 
 # --------------------------------------------------
@@ -116,18 +163,25 @@ ANSWER:
 
 def main():
 
+    # Read API key securely from Streamlit Secrets
+    api_key = st.secrets["GOOGLE_API_KEY"]
+
     st.set_page_config(
         page_title="DocuMind AI",
-        page_icon="📄"
+        page_icon="📄",
+        layout="wide"
     )
 
-    st.header("DocuMind AI 📄")
-    st.write("Upload PDF documents and ask questions about them.")
+    st.title("DocuMind AI 📄")
+
+    st.write(
+        "Upload PDF documents and ask questions based on their content."
+    )
 
 
-    # ----------------------------------------------
+    # --------------------------------------------------
     # SESSION STATE
-    # ----------------------------------------------
+    # --------------------------------------------------
 
     if "vector_store" not in st.session_state:
         st.session_state.vector_store = None
@@ -135,23 +189,20 @@ def main():
     if "conversation_history" not in st.session_state:
         st.session_state.conversation_history = []
 
+    if "pdf_names" not in st.session_state:
+        st.session_state.pdf_names = []
 
-    # ----------------------------------------------
+
+    # --------------------------------------------------
     # SIDEBAR
-    # ----------------------------------------------
+    # --------------------------------------------------
 
     with st.sidebar:
 
-        st.title("Settings ⚙️")
+        st.title("DocuMind AI")
 
-        api_key = st.text_input(
-            "Enter your Google Gemini API Key",
-            type="password"
-        )
-
-        st.markdown(
-            "Get your API key from "
-            "[Google AI Studio](https://aistudio.google.com/app/apikey)"
+        st.caption(
+            "Upload your PDF documents and ask questions about them."
         )
 
         st.divider()
@@ -165,11 +216,14 @@ def main():
         )
 
 
-        # ------------------------------------------
+        # --------------------------------------------------
         # PROCESS PDF BUTTON
-        # ------------------------------------------
+        # --------------------------------------------------
 
-        if st.button("Submit & Process"):
+        if st.button(
+            "Submit & Process",
+            use_container_width=True
+        ):
 
             if not pdf_docs:
 
@@ -183,42 +237,75 @@ def main():
                     "Reading and processing PDFs..."
                 ):
 
-                    raw_text = get_pdf_text(pdf_docs)
+                    try:
 
-                    if not raw_text.strip():
+                        raw_text = get_pdf_text(pdf_docs)
+
+                        if not raw_text.strip():
+
+                            st.error(
+                                "Could not extract text from these PDFs."
+                            )
+
+                        else:
+
+                            text_chunks = get_text_chunks(
+                                raw_text
+                            )
+
+                            st.session_state.vector_store = (
+                                get_vector_store(text_chunks)
+                            )
+
+                            st.session_state.pdf_names = [
+                                pdf.name for pdf in pdf_docs
+                            ]
+
+                            # Clear previous conversation
+                            st.session_state.conversation_history = []
+
+                            st.success(
+                                "PDFs processed successfully! 🎉"
+                            )
+
+                    except Exception as error:
 
                         st.error(
-                            "Could not extract text from these PDFs."
-                        )
-
-                    else:
-
-                        text_chunks = get_text_chunks(
-                            raw_text
-                        )
-
-                        st.session_state.vector_store = (
-                            get_vector_store(text_chunks)
-                        )
-
-                        st.session_state.pdf_names = [
-                            pdf.name for pdf in pdf_docs
-                        ]
-
-                        st.success(
-                            "PDFs processed successfully! 🎉"
+                            f"Error while processing PDFs: {error}"
                         )
 
 
-        # ------------------------------------------
+        # --------------------------------------------------
+        # DISPLAY PROCESSED FILES
+        # --------------------------------------------------
+
+        if st.session_state.pdf_names:
+
+            st.divider()
+
+            st.subheader("Processed Files")
+
+            for file_name in st.session_state.pdf_names:
+
+                st.write(f"📄 {file_name}")
+
+
+        # --------------------------------------------------
         # RESET BUTTON
-        # ------------------------------------------
+        # --------------------------------------------------
 
-        if st.button("Reset Conversation"):
+        st.divider()
+
+        if st.button(
+            "Reset Conversation",
+            use_container_width=True
+        ):
 
             st.session_state.vector_store = None
 
             st.session_state.conversation_history = []
+
+            st.session_state.pdf_names = []
 
             st.success(
                 "Conversation has been reset."
@@ -232,9 +319,11 @@ def main():
     for item in st.session_state.conversation_history:
 
         with st.chat_message("user"):
+
             st.write(item["question"])
 
         with st.chat_message("assistant"):
+
             st.write(item["answer"])
 
 
@@ -248,16 +337,6 @@ def main():
 
 
     if user_question:
-
-        # Check API key
-        if not api_key:
-
-            st.warning(
-                "Please enter your Google Gemini API key in the sidebar."
-            )
-
-            return
-
 
         # Check whether PDFs are processed
         if st.session_state.vector_store is None:
@@ -288,6 +367,7 @@ def main():
                         api_key
                     )
 
+                    # Display only clean answer
                     st.write(answer)
 
 
@@ -295,10 +375,7 @@ def main():
                     st.session_state.conversation_history.append(
                         {
                             "question": user_question,
-                            "answer": answer,
-                            "timestamp": datetime.now().strftime(
-                                "%Y-%m-%d %H:%M:%S"
-                            )
+                            "answer": answer
                         }
                     )
 
@@ -315,4 +392,5 @@ def main():
 # --------------------------------------------------
 
 if __name__ == "__main__":
+
     main()

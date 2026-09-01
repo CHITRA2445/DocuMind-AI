@@ -100,7 +100,7 @@ ANSWER:
 """
 
     model = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
+        model="gemini-3.6-flash",
         temperature=0.3,
         google_api_key=api_key
     )
